@@ -27,6 +27,9 @@ import io.ktor.server.netty.Netty
 import io.ktor.websocket.WebSockets
 import io.ktor.websocket.webSocket
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
@@ -72,6 +75,7 @@ class WeChatHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     // WebSocket sessions for live broadcast
     private val webSocketSessions =
         Collections.synchronizedSet(mutableSetOf<io.ktor.http.cio.websocket.DefaultWebSocketSession>())
+    private val moduleScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gson = Gson()
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam) {
@@ -176,7 +180,8 @@ class WeChatHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         val appState = hookedApps[appId]
                         if (appState?.appBrandCommonBindingJniInstance?.compareAndSet(
                                 null, instance
-                            ) == true) {
+                            ) == true
+                        ) {
                             log("$label Associated instance ${instance.hashCode()} with appId: $appId")
                         } else if (no == 1) {
                             appState?.appBrandCommonBindingJniInstance?.set(instance)
@@ -184,11 +189,11 @@ class WeChatHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         }
 
 //                        if (no > 0) {
-                            log("$label [REQ] $appId #$no -> $api | $data | ${
-                                param.args.drop(2).joinToString { it?.toString() ?: "null" }
-                            }")
-                            // Broadcast to WebSocket clients
-                            broadcastLog(LogBroadcast("request", api, data))
+                        log("$label [REQ] $appId #$no -> $api | $data | ${
+                            param.args.drop(2).joinToString { it?.toString() ?: "null" }
+                        }")
+                        // Broadcast to WebSocket clients
+                        broadcastLog(LogBroadcast("request", api, data))
 //                        }
                     }
                 })
@@ -331,7 +336,7 @@ class WeChatHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         sessionsCopy.forEach { session ->
             try {
                 // Launch non-blocking coroutine for each session
-                kotlinx.coroutines.GlobalScope.launch {
+                moduleScope.launch {
                     try {
                         session.send(Frame.Text(json))
                     } catch (e: Throwable) {
