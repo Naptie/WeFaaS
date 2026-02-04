@@ -35,6 +35,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import java.time.Instant
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
@@ -50,7 +51,7 @@ data class InvokeRequest(
 
 data class LogBroadcast(
     val type: String, // "request" or "response"
-    val api: String, val data: String
+    val id: Int, val api: String, val data: String
 )
 
 class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
@@ -58,6 +59,12 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
     private val label = "[WeFaaS]"
     private val logList = mutableListOf<String>()
     private val maxLogSize = 1500
+
+    private val apiMap =
+        Collections.synchronizedMap(object : java.util.LinkedHashMap<Int, String>() {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, String>?) =
+                size > 50
+        })
 
     private val isHooked = AtomicReference(false)
     private val currentAppId = AtomicReference<String?>(null)
@@ -162,17 +169,18 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         val instance = param.thisObject
                         val api = param.args[0] as String
                         val data = param.args[1] as String
-                        val no = param.args[3] as Int
+                        val id = param.args[3] as Int
 
                         appBrandCommonBindingJniInstance.set(instance)
 
-//                        if (no > 0) {
-                        log("$label [REQ] $appId #$no -> $api | $data | ${
+//                        if (id > 0) {
+                        log("$label [REQ] $appId #$id -> $api | $data | ${
                             param.args.drop(2).joinToString { it?.toString() ?: "null" }
                         }")
                         // Broadcast to WebSocket clients
-                        broadcastLog(LogBroadcast("request", api, data))
+                        broadcastLog(LogBroadcast("request", id, api, data))
 //                        }
+                        apiMap[id] = api
                     }
                 })
             log("$label Hooked nativeInvokeHandler successfully.")
@@ -192,14 +200,15 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val appId = currentAppId.get() ?: return
                         val id = param.args[0] as Int
-                        val res = param.args[1] as String
+                        val data = param.args[1] as String
+                        val api = apiMap[id] ?: "callback"
 
-                        log("$label [RES] $appId #$id <- $res | ${
+                        log("$label [RES] $appId #$id <- $api | $data | ${
                             param.args.drop(2).joinToString { it?.toString() ?: "null" }
                         }")
 
                         // Broadcast to WebSocket clients
-                        broadcastLog(LogBroadcast("response", "callback", res))
+                        broadcastLog(LogBroadcast("response", id, api, data))
 
                         // Update per-app counter to match the system's counter if provided
 //                        if (id > 0) invokeAsyncRequestCounter.set(id)
@@ -207,7 +216,7 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         // Check if this is a response for our active call
                         if (pendingRequests.containsKey(id)) {
 //                            log("$label [RES] Match found for ID: $requestId")
-                            pendingRequests[id]?.complete(res)
+                            pendingRequests[id]?.complete(data)
                         }
                     }
                 })
@@ -273,21 +282,22 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 }
                 // WebSocket endpoint for live broadcast logs
                 webSocket("/ws/logs") {
-                    log("$label WebSocket client connected")
+                    val clientId = UUID.randomUUID().toString().take(8)
+                    log("$label [WebSocket] New connection: $clientId")
                     webSocketSessions.add(this)
                     try {
                         for (frame in incoming) {
-                            // Keep connection alive, ignore incoming messages
                             if (frame is Frame.Text) {
-                                frame.readText() // Just consume the message
+                                frame.readText()
                             }
                         }
                     } catch (e: ClosedReceiveChannelException) {
-                        log("$label WebSocket client disconnected")
+                        log("$label [WebSocket] Connection closed normally: $clientId")
                     } catch (e: Throwable) {
-                        log("$label WebSocket error: ${e.message}")
+                        log("$label [WebSocket] Connection error ($clientId): ${e.message}")
                     } finally {
                         webSocketSessions.remove(this)
+                        log("$label [WebSocket] Client disconnected and removed: $clientId")
                     }
                 }
             }
