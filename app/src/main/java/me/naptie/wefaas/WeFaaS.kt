@@ -33,9 +33,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import java.time.Instant
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 
@@ -53,24 +53,18 @@ data class LogBroadcast(
     val api: String, val data: String
 )
 
-// Per-app state containing the JNI instance and request counter
-data class HookedAppState(
-    val appBrandCommonBindingJniInstance: AtomicReference<Any?> = AtomicReference(null),
-    val invokeAsyncRequestCounter: AtomicInteger = AtomicInteger(0)
-)
-
 class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
-    private var serverStarted = false
     private val label = "[WeFaaS]"
     private val logList = mutableListOf<String>()
     private val maxLogSize = 1500
 
-    // Map of appId -> HookedAppState (instance + counter)
-    private val hookedApps = ConcurrentHashMap<String, HookedAppState>()
+    private val isHooked = AtomicReference(false)
+    private val currentAppId = AtomicReference<String?>(null)
+    private val appBrandCommonBindingJniInstance: AtomicReference<Any?> = AtomicReference(null)
 
-    // Store pending requests: appId-callbackId -> Deferred Result
-    private val pendingRequests = ConcurrentHashMap<String, CompletableDeferred<String>>()
+    // Store pending requests: requestId -> Deferred Result
+    private val pendingRequests = ConcurrentHashMap<Int, CompletableDeferred<String>>()
 
     // WebSocket sessions for live broadcast
     private val webSocketSessions =
@@ -132,20 +126,12 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val appId = param.result as? String ?: return
 
-                        // Check if this app is already registered
-                        if (hookedApps.containsKey(appId)) {
-                            return
+                        if (isHooked.compareAndSet(false, true)) {
+                            injectHandlerHooks(classLoader)
+                            startServer()
                         }
 
-                        log("$label Found new AppID: $appId - Registering app state...")
-
-                        // Create state and inject hooks for this app
-                        val appState = HookedAppState()
-                        hookedApps[appId] = appState
-                        injectHandlerHooks(classLoader, appId)
-
-                        // Start server when first app is discovered
-                        startServerIfNeeded()
+                        currentAppId.set(appId)
                     }
                 })
             log("$label Hooked getAppId successfully.")
@@ -157,7 +143,7 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
         return success
     }
 
-    private fun injectHandlerHooks(classLoader: ClassLoader, appId: String) {
+    private fun injectHandlerHooks(classLoader: ClassLoader) {
         try {
             // REQUEST (nativeInvokeHandler)
             XposedHelpers.findAndHookMethod("com.tencent.mm.appbrand.commonjni.AppBrandCommonBindingJni",
@@ -172,21 +158,13 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 "int",                        // arg7
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
+                        val appId = currentAppId.get() ?: return
                         val instance = param.thisObject
                         val api = param.args[0] as String
                         val data = param.args[1] as String
                         val no = param.args[3] as Int
 
-                        val appState = hookedApps[appId]
-                        if (appState?.appBrandCommonBindingJniInstance?.compareAndSet(
-                                null, instance
-                            ) == true
-                        ) {
-                            log("$label Associated instance ${instance.hashCode()} with appId: $appId")
-                        } else if (no == 1) {
-                            appState?.appBrandCommonBindingJniInstance?.set(instance)
-                            log("$label Associated new instance ${instance.hashCode()} with appId: $appId")
-                        }
+                        appBrandCommonBindingJniInstance.set(instance)
 
 //                        if (no > 0) {
                         log("$label [REQ] $appId #$no -> $api | $data | ${
@@ -212,6 +190,7 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 String::class.java, // extra
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
+                        val appId = currentAppId.get() ?: return
                         val id = param.args[0] as Int
                         val res = param.args[1] as String
 
@@ -223,26 +202,18 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
                         broadcastLog(LogBroadcast("response", "callback", res))
 
                         // Update per-app counter to match the system's counter if provided
-                        hookedApps[appId]?.invokeAsyncRequestCounter?.set(id)
+//                        if (id > 0) invokeAsyncRequestCounter.set(id)
 
                         // Check if this is a response for our active call
-                        val requestId = "$appId-$id"
-                        if (pendingRequests.containsKey(requestId)) {
+                        if (pendingRequests.containsKey(id)) {
 //                            log("$label [RES] Match found for ID: $requestId")
-                            pendingRequests[requestId]?.complete(res)
+                            pendingRequests[id]?.complete(res)
                         }
                     }
                 })
             log("$label Hooked invokeCallbackHandler successfully.")
         } catch (e: Throwable) {
             log("$label Failed to hook Response: ${e.message}")
-        }
-    }
-
-    private fun startServerIfNeeded() {
-        if (!serverStarted) {
-            startServer()
-            serverStarted = true
         }
     }
 
@@ -351,15 +322,13 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
         isSync: Boolean = false,
         arg7: Int = -1
     ): String {
-        // Get the app state from the map based on the incoming appId
-        val appState = hookedApps[appId]
-        if (appState == null) {
-            val msg = "No hooked app found for appId: $appId. Please open the Mini Program first."
+        if (currentAppId.get() != appId) {
+            val msg = "Unable to locate appId: $appId. Please open the Mini Program first."
             log("$label $msg")
             throw IllegalStateException(msg)
         }
 
-        val instance = appState.appBrandCommonBindingJniInstance.get()
+        val instance = appBrandCommonBindingJniInstance.get()
         if (instance == null) {
             val msg =
                 "AppBrandCommonBindingJniInstance is null for appId: $appId. Please open the Mini Program first."
@@ -367,13 +336,11 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
             throw IllegalStateException(msg)
         }
 
-        // Track the currently processing request
-        val callbackId = appState.invokeAsyncRequestCounter.incrementAndGet()
-        val requestId = "$appId-$callbackId"
+        val requestId = Instant.now().toEpochMilli().toInt()
         val deferred = CompletableDeferred<String>()
         pendingRequests[requestId] = deferred
 
-        log("$label Invoke $appId #$callbackId | $api")
+        log("$label Invoke $appId #$requestId | $api")
 
         try {
             val invokeMethod = instance::class.java.getMethod(
@@ -389,7 +356,7 @@ class WeFaaS : IXposedHookLoadPackage, IXposedHookZygoteInit {
             invokeMethod.isAccessible = true
 
             invokeMethod.invoke(
-                instance, api, data, extra, callbackId, isSync, 0, arg7
+                instance, api, data, extra, requestId, isSync, 0, arg7
             )
 
             // Wait for response
