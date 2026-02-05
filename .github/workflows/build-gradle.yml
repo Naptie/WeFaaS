@@ -2,14 +2,53 @@ name: Build with Gradle
 
 on:
   push:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   build-gradle:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-    - name: Setup Gradle
-      uses: gradle/gradle-build-action@v2
-    - name: Run build with Gradle Wrapper
-      run: ./gradlew build
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Obtain current datetime
+        id: current-datetime
+        run: echo "CURRENT_DATETIME=$(date +'%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: 17
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Build with Gradle
+        run: ./gradlew bundle && ./gradlew assembleRelease
+
+      - name: Sign APK
+        id: sign-apk
+        uses: kevin-david/zipalign-sign-android-release@v2
+        with:
+          releaseDirectory: app/build/outputs/apk/release/
+          signingKeyBase64: ${{ secrets.RELEASE_KEYSTORE }}
+          keyStorePassword: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          zipAlign: true
+        env:
+          BUILD_TOOLS_VERSION: "36.0.0"
+
+      - name: Move and rename builds
+        run: |
+          mkdir -p ~/artifacts/
+          mv app/build/outputs/bundle/release/app-release.aab ~/artifacts/WeFaaS_${{ steps.current-datetime.outputs.CURRENT_DATETIME }}.aab
+          mv ${{ steps.sign-apk.outputs.signedReleaseFile }} ~/artifacts/WeFaaS_${{ steps.current-datetime.outputs.CURRENT_DATETIME }}.apk
+          ls -l ~/artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wefaas-${{ steps.current-datetime.outputs.CURRENT_DATETIME }}
+          path: ~/artifacts/*
